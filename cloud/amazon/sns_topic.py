@@ -71,7 +71,7 @@ options:
     required: False
     default: True
 extends_documentation_fragment: aws
-requirements: [ "boto" ]
+requirements: [ "boto3" ]
 """
 
 EXAMPLES = """
@@ -95,6 +95,10 @@ EXAMPLES = """
     subscriptions:
       - endpoint: "my_email_address@example.com"
         protocol: "email"
+        # raw_message_delivery is optional, default is 'false' if not provided for new subscription
+        # for existing subscription, it will only attempt to update the attribute if value is provided.
+        raw_message_delivery: "true" 
+
       - endpoint: "my_mobile_number"
         protocol: "sms"
 
@@ -131,12 +135,13 @@ import json
 import re
 
 try:
-    import boto.sns
-    from boto.exception import BotoServerError
-    HAS_BOTO = True
-except ImportError:
-    HAS_BOTO = False
+    import boto3
+    import botocore
+    HAS_BOTO3 = True
+except:
+    HAS_BOTO3 = False
 
+from botocore.exceptions import ClientError
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.ec2 import connect_to_aws, ec2_argument_spec, get_aws_connection_info
 
@@ -180,23 +185,26 @@ class SnsTopicManager(object):
 
     def _get_boto_connection(self):
         try:
-            return connect_to_aws(boto.sns, self.region,
-                **self.aws_connect_params)
-        except BotoServerError as err:
+            return boto3.client('sns')
+        except ClientError as err:
             self.module.fail_json(msg=err.message)
 
     def _get_all_topics(self):
-        next_token = None
         topics = []
+        next_token = None
         while True:
             try:
-                response = self.connection.get_all_topics(next_token)
-            except BotoServerError as err:
+                if next_token is None:
+                    response = self.connection.list_topics()
+                else:
+                    response = self.connection.list_topics(NextToken=next_token)
+            except ClientError as err:
                 self.module.fail_json(msg=err.message)
-            topics.extend(response['ListTopicsResponse']['ListTopicsResult']['Topics'])
-            next_token = response['ListTopicsResponse']['ListTopicsResult']['NextToken']
-            if not next_token:
+            topics.extend(response['Topics'])
+            if 'NextToken' not in response:
                 break
+            else:
+                next_token=response['NextToken']
         return [t['TopicArn'] for t in topics]
 
 
@@ -213,7 +221,7 @@ class SnsTopicManager(object):
         self.changed = True
         self.topic_created = True
         if not self.check_mode:
-            self.connection.create_topic(self.name)
+            self.connection.create_topic(Name=self.name)
             self.arn_topic = self._arn_topic_lookup()
             while not self.arn_topic:
                 time.sleep(3)
@@ -221,31 +229,30 @@ class SnsTopicManager(object):
 
 
     def _set_topic_attrs(self):
-        topic_attributes = self.connection.get_topic_attributes(self.arn_topic) \
-            ['GetTopicAttributesResponse'] ['GetTopicAttributesResult'] \
+        topic_attributes = self.connection.get_topic_attributes(TopicArn=self.arn_topic) \
             ['Attributes']
 
         if self.display_name and self.display_name != topic_attributes['DisplayName']:
             self.changed = True
             self.attributes_set.append('display_name')
             if not self.check_mode:
-                self.connection.set_topic_attributes(self.arn_topic, 'DisplayName',
-                    self.display_name)
+                self.connection.set_topic_attributes(TopicArn=self.arn_topic, AttributeName='DisplayName',
+                                                     AttributeValue=self.display_name)
 
         if self.policy and self.policy != json.loads(topic_attributes['Policy']):
             self.changed = True
             self.attributes_set.append('policy')
             if not self.check_mode:
-                self.connection.set_topic_attributes(self.arn_topic, 'Policy',
-                    json.dumps(self.policy))
+                self.connection.set_topic_attributes(TopicArn=self.arn_topic, AttributeName='Policy',
+                                                     AttributeValue=json.dumps(self.policy))
 
         if self.delivery_policy and ('DeliveryPolicy' not in topic_attributes or \
-           self.delivery_policy != json.loads(topic_attributes['DeliveryPolicy'])):
+                                     self.delivery_policy != json.loads(topic_attributes['DeliveryPolicy'])):
             self.changed = True
             self.attributes_set.append('delivery_policy')
             if not self.check_mode:
-                self.connection.set_topic_attributes(self.arn_topic, 'DeliveryPolicy',
-                    json.dumps(self.delivery_policy))
+                self.connection.set_topic_attributes(TopicArn=self.arn_topic, AttributeName='DeliveryPolicy',
+                                                     AttributeValue=json.dumps(self.delivery_policy))
 
 
     def _canonicalize_endpoint(self, protocol, endpoint):
@@ -257,37 +264,78 @@ class SnsTopicManager(object):
     def _get_topic_subs(self):
         next_token = None
         while True:
-            response = self.connection.get_all_subscriptions_by_topic(self.arn_topic, next_token)
-            self.subscriptions_existing.extend(response['ListSubscriptionsByTopicResponse'] \
-                ['ListSubscriptionsByTopicResult']['Subscriptions'])
-            next_token = response['ListSubscriptionsByTopicResponse'] \
-                ['ListSubscriptionsByTopicResult']['NextToken']
-            if not next_token:
+            if next_token is None:
+                response = self.connection.list_subscriptions_by_topic(TopicArn=self.arn_topic)
+            else:
+                response = self.connection.list_subscriptions_by_topic(TopicArn=self.arn_topic,
+                                                                       NextToken=next_token)
+            self.subscriptions_existing.extend(response['Subscriptions'])
+            if 'NextToken' not in response:
                 break
+            else:
+                next_token = response['NextToken']
+
+    def _get_existing_subscription_arn(self, protocol, endpoint):
+        for sub in self.subscriptions_existing:
+            if sub['Protocol'] == protocol and sub['Endpoint'] == endpoint:
+                return sub['SubscriptionArn']
 
     def _set_topic_subs(self):
         subscriptions_existing_list = []
-        desired_subscriptions = [(sub['protocol'],
-            self._canonicalize_endpoint(sub['protocol'], sub['endpoint'])) for sub in
-            self.subscriptions]
+        desired_subscriptions = []
+        desired_subscriptions_with_attributes = []
+
+        for sub in self.subscriptions:
+            raw_message_delivery = sub['raw_message_delivery'] if 'raw_message_delivery' in sub else None
+
+            # The reason for creating two list here is because the AWS API list_subscriptions_by_topic
+            # (see self.subscriptions_existing) doesn't contain the subscription attribute.
+            # I could loop through each subscription and then fetch the raw_message_delivery attribute,
+            # but it requires extra AWS API calls and makes code too complex to read.
+            # Anyway due to the missing subscription attribute in the response, we are unable to compare
+            # the existing subscription with desired subscription dictionary on the combination of
+            # (protocal, endpoint, raw_message_delivery).
+
+            # Hence I am creating a new list for desired subscriptions with raw_message_delivery attribute
+            # so we can loop through this local dictionary to set the raw_message_delivery attribute(if value provided)
+            # regardless what the existing value is.
+
+            # Reference http://boto3.readthedocs.io/en/latest/reference/services/sns.html#SNS.Client.list_subscriptions_by_topic
+            desired_subscriptions = [(sub['protocol'],
+                                      self._canonicalize_endpoint(sub['protocol'], sub['endpoint'])) for sub in
+                                     self.subscriptions]
+
+            desired_subscriptions_with_attributes.append((sub['protocol'],
+                                          self._canonicalize_endpoint(sub['protocol'], sub['endpoint']),
+                                          raw_message_delivery))
 
         if self.subscriptions_existing:
             for sub in self.subscriptions_existing:
                 sub_key = (sub['Protocol'], sub['Endpoint'])
                 subscriptions_existing_list.append(sub_key)
                 if self.purge_subscriptions and sub_key not in desired_subscriptions and \
-                    sub['SubscriptionArn'] != 'PendingConfirmation':
+                        sub['SubscriptionArn'] != 'PendingConfirmation':
                     self.changed = True
                     self.subscriptions_deleted.append(sub_key)
                     if not self.check_mode:
-                        self.connection.unsubscribe(sub['SubscriptionArn'])
+                        self.connection.unsubscribe(SubscriptionArn=sub['SubscriptionArn'])
 
-        for (protocol, endpoint) in desired_subscriptions:
+        for (protocol, endpoint, raw_message_delivery) in desired_subscriptions_with_attributes:
             if (protocol, endpoint) not in subscriptions_existing_list:
                 self.changed = True
                 self.subscriptions_added.append(sub)
                 if not self.check_mode:
-                    self.connection.subscribe(self.arn_topic, protocol, endpoint)
+                    response = self.connection.subscribe(TopicArn=self.arn_topic, Protocol=protocol, Endpoint=endpoint)
+                    if raw_message_delivery is not None:
+                        self.connection.set_subscription_attributes(SubscriptionArn=response['SubscriptionArn'],
+                                                                    AttributeName="RawMessageDelivery",
+                                                                    AttributeValue=raw_message_delivery)
+            elif (protocol, endpoint) in subscriptions_existing_list and raw_message_delivery is not None:
+                self.changed = True
+                arn_subscription = self._get_existing_subscription_arn(protocol, endpoint)
+                self.connection.set_subscription_attributes(SubscriptionArn=arn_subscription,
+                                                            AttributeName="RawMessageDelivery",
+                                                            AttributeValue=raw_message_delivery)
 
 
     def _delete_subscriptions(self):
@@ -298,14 +346,14 @@ class SnsTopicManager(object):
                 self.subscriptions_deleted.append(sub['SubscriptionArn'])
                 self.changed = True
                 if not self.check_mode:
-                    self.connection.unsubscribe(sub['SubscriptionArn'])
+                    self.connection.unsubscribe(SubscriptionArn=sub['SubscriptionArn'])
 
 
     def _delete_topic(self):
         self.topic_deleted = True
         self.changed = True
         if not self.check_mode:
-            self.connection.delete_topic(self.arn_topic)
+            self.connection.delete_topic(TopicArn=self.arn_topic)
 
 
     def ensure_ok(self):
@@ -319,10 +367,10 @@ class SnsTopicManager(object):
     def ensure_gone(self):
         self.arn_topic = self._arn_topic_lookup()
         if self.arn_topic:
-           self._get_topic_subs()
-           if self.subscriptions_existing:
-               self._delete_subscriptions()
-           self._delete_topic()
+            self._get_topic_subs()
+            if self.subscriptions_existing:
+                self._delete_subscriptions()
+            self._delete_topic()
 
 
     def get_info(self):
@@ -353,7 +401,7 @@ def main():
         dict(
             name=dict(type='str', required=True),
             state=dict(type='str', default='present', choices=['present',
-                'absent']),
+                                                               'absent']),
             display_name=dict(type='str', required=False),
             policy=dict(type='dict', required=False),
             delivery_policy=dict(type='dict', required=False),
@@ -365,8 +413,8 @@ def main():
     module = AnsibleModule(argument_spec=argument_spec,
                            supports_check_mode=True)
 
-    if not HAS_BOTO:
-        module.fail_json(msg='boto required for this module')
+    if not HAS_BOTO3:
+        module.fail_json(msg='boto3 required for this module')
 
     name = module.params.get('name')
     state = module.params.get('state')
