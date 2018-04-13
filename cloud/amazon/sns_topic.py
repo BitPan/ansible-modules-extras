@@ -325,12 +325,9 @@ class SnsTopicManager(object):
                 self.changed = True
                 self.subscriptions_added.append(sub)
                 if not self.check_mode:
-                    response = self.connection.subscribe(TopicArn=self.arn_topic, Protocol=protocol, Endpoint=endpoint)
-                    if raw_message_delivery is not None:
-                        self.connection.set_subscription_attributes(SubscriptionArn=response['SubscriptionArn'],
-                                                                    AttributeName="RawMessageDelivery",
-                                                                    AttributeValue=raw_message_delivery)
-            elif (protocol, endpoint) in subscriptions_existing_list and raw_message_delivery is not None:
+                    self.connection.subscribe(TopicArn=self.arn_topic, Protocol=protocol, Endpoint=endpoint)
+
+            if raw_message_delivery is not None:
                 self.changed = True
                 arn_subscription = self._get_existing_subscription_arn(protocol, endpoint)
                 self.connection.set_subscription_attributes(SubscriptionArn=arn_subscription,
