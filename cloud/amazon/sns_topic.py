@@ -71,7 +71,7 @@ options:
     required: False
     default: True
 extends_documentation_fragment: aws
-requirements: [ "boto" ]
+requirements: [ "boto3" ]
 """
 
 EXAMPLES = """
@@ -95,6 +95,10 @@ EXAMPLES = """
     subscriptions:
       - endpoint: "my_email_address@example.com"
         protocol: "email"
+        # raw_message_delivery is optional, default is 'false' if not provided for new subscription
+        # for existing subscription, it will only attempt to update the attribute if value is provided.
+        raw_message_delivery: "true" 
+
       - endpoint: "my_mobile_number"
         protocol: "sms"
 
